@@ -110,6 +110,11 @@ class STeMI(nn.Module):
         nn.init.trunc_normal_(self.pos_embed_2, std=.02)
         nn.init.trunc_normal_(self.pos_embed_3, std=.02)
 
+        # --- Learnable Multi-Scale Weights ---
+        # Initialized to ones; they will be moved to device when model.to(device) is called
+        self.temporal_scale_weights = nn.Parameter(torch.ones(self.temporal_scales))
+        self.spatial_scale_weights = nn.Parameter(torch.ones(self.spatial_scales))
+
         self.reconstruction = Reconstruction(num_feature)
 
         self.fc1 = nn.Sequential(
@@ -149,6 +154,9 @@ class STeMI(nn.Module):
         recon_support = support_feat_out.clone()
         recon_x = x_out.clone()
 
+        # ---------------------------
+        # Learnable Spatial Scale Fusion
+        # ---------------------------
         merge_scales_space = []
         height = x_out.shape[3]
         for i in range(self.spatial_scales):
@@ -168,10 +176,21 @@ class STeMI(nn.Module):
             ).to(x.device)
             compress_merge = feature_compress(merge_scale)
             merge_scales_space.append(compress_merge)
-        merge_scales_all_space = torch.cat(merge_scales_space, 3)
-        merge_scales_all_space = F.interpolate(merge_scales_all_space, size=(merge_scales_all_space.shape[2], merge_scales_all_space.shape[2]))
-        merge_scales_all_space = merge_scales_all_space.view(merge_scales_all_space.shape[0], merge_scales_all_space.shape[1], 1024)
 
+        # Stack along new dim = scales: shape -> [scales, B, C, H, W]
+        merge_scales_space = torch.stack(merge_scales_space, dim=0)
+
+        # Softmax-normalize spatial weights and apply weighted sum across scales
+        spatial_w = torch.softmax(self.spatial_scale_weights, dim=0).view(-1, 1, 1, 1, 1)  # [scales,1,1,1,1]
+        weighted_space = (spatial_w * merge_scales_space).sum(dim=0)  # [B, C, H, W]
+
+        # Interpolate to square (same behavior as original) and flatten spatial dims
+        weighted_space = F.interpolate(weighted_space, size=(weighted_space.shape[2], weighted_space.shape[2]))
+        merge_scales_all_space = weighted_space.view(weighted_space.shape[0], weighted_space.shape[1], -1)  # [B, C, H*W]
+
+        # ---------------------------
+        # Attention & Temporal preparations
+        # ---------------------------
         support_feat_out = self.attention(support_feature)
         support_feat_out = support_feat_out + support_feature
         support_summary_out = self.attention(support_summary)
@@ -183,31 +202,50 @@ class STeMI(nn.Module):
         x_out = self.attention(x)
         x_out = x_out + x
 
+        # ---------------------------
+        # Learnable Temporal Scale Fusion
+        # ---------------------------
         merge_scales_tpl = []
         row_sfo = support_feat_out.shape[1]
         row_sso = support_summary_out.shape[1]
         row_sup = support_updim.shape[1]
         row_xot = x_out.shape[1]
         column = support_feature.shape[2]
+
         for i in range(self.temporal_scales):
             adapt_pool_sfo = nn.AdaptiveAvgPool2d((row_sfo, column)).to(x.device)
             adapt_pool_sso = nn.AdaptiveAvgPool2d((row_sso, column)).to(x.device)
             adapt_pool_sup = nn.AdaptiveAvgPool2d((row_sup, column)).to(x.device)
             adapt_pool_xot = nn.AdaptiveAvgPool2d((row_xot, column)).to(x.device)
-            sfo_scale = adapt_pool_sfo(support_feat_out).unsqueeze(0)
+            sfo_scale = adapt_pool_sfo(support_feat_out).unsqueeze(0)    # [1, row_sfo, column]
             sso_scale = adapt_pool_sso(support_summary_out).unsqueeze(0)
             sup_scale = adapt_pool_sup(support_updim).unsqueeze(0)
             xot_scale = adapt_pool_xot(x_out).unsqueeze(0)
-            merge_scale = torch.cat([sfo_scale, sso_scale, sup_scale, xot_scale], 2)
-            merge_scale = F.interpolate(merge_scale, size=(x.shape[1], x.shape[2]))
-            merge_scales_tpl.append(merge_scale)
+            merge_scale = torch.cat([sfo_scale, sso_scale, sup_scale, xot_scale], 2)  # concat on temporal dim
+            merge_scale = F.interpolate(merge_scale, size=(x.shape[1], x.shape[2]))  # make consistent with query shape
+            merge_scales_tpl.append(merge_scale)  # each element shape [1, T, F] roughly
             row_sfo = int(row_sfo / 2)
             row_sso = int(row_sso / 2)
             row_sup = int(row_sup / 2)
             row_xot = int(row_xot / 2)
-        merge_scales_tpl = torch.stack(merge_scales_tpl, dim=2)
-        merge_scales_all_tpl = torch.mean(merge_scales_tpl, 2)
-        merge_scales_all_tpl = merge_scales_all_tpl.squeeze(0)
+
+        # Stack along scales dim: resulting shape [scales, B?, T, F] depending on shapes
+        # Many tensors here have leading dim 1 (batch dim). We stack along dim=0 then sum weighted.
+        merge_scales_tpl = torch.cat(merge_scales_tpl, dim=0)  # [scales, B, T, F] if B==1 or similar
+
+        # Normalize temporal weights and apply weighted sum across scales
+        temp_w = torch.softmax(self.temporal_scale_weights, dim=0).view(-1, 1, 1, 1)  # [scales,1,1,1]
+        merge_scales_all_tpl = (temp_w * merge_scales_tpl).sum(dim=0)  # [B, T, F] or [1, T, F]
+
+        # Squeeze batch-first if needed (original code did squeeze(0))
+        if merge_scales_all_tpl.dim() == 4 and merge_scales_all_tpl.size(0) == 1:
+            merge_scales_all_tpl = merge_scales_all_tpl.squeeze(0)
+        elif merge_scales_all_tpl.dim() == 3 and merge_scales_all_tpl.size(0) == 1:
+            merge_scales_all_tpl = merge_scales_all_tpl.squeeze(0)
+
+        # ---------------------------
+        # Merge temporal & spatial features (same as original)
+        # ---------------------------
         merge_scales_all = torch.cat([merge_scales_all_tpl, merge_scales_all_space], 2)    # 横向拼接
         _, _, dim_merge = merge_scales_all.shape
         fc_2 = nn.Linear(dim_merge, self.num_feature).to(x.device)
